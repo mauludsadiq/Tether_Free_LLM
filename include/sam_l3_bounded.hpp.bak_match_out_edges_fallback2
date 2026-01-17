@@ -1,0 +1,502 @@
+// sam_l3_bounded.hpp
+// ------------------
+// 2026 Tier-0 Zero-Load engine:
+// - Suffix Automaton in 64B nodes (cacheline-aligned)
+// - Fixed-size transitions: 2 inline + 4-slot open-addressing hash (in-node)
+// - 32-bit indices
+// - Sliding-window bounded memory: keep SAM <= L3 budget for ~128k tokens
+//
+// Tier-0 usage:
+//   - extend_verified(token) after each accepted/verified token
+//   - propose(k_max, min_occ=2, max_deg=1) to get 0-FLOP speculative tokens
+//
+// Notes:
+// - Bounded SAM is nontrivial to "evict" state-by-state due to suffix links.
+// - Production-safe solution: keep a 128k token ring and rebuild SAM when window slides.
+// - Rebuild cost O(W) is rare and deterministic; W=128k is cheap vs NPU loads.
+
+#pragma once
+#include <cstdint>
+#include <vector>
+#include <algorithm>
+
+static constexpr uint32_t NIL = 0xFFFFFFFFu;
+static constexpr uint32_t EMPTY_KEY = 0xFFFFFFFFu;
+
+// ------------------------------
+// 64-byte packed node (cacheline)
+// ------------------------------
+struct alignas(64) SamNode64 {
+    // 16B header
+    uint32_t len;     // longest length
+    uint32_t link;    // suffix link
+    uint32_t occ;     // occurrence count / frequency proxy
+    uint32_t _pad0;   // reserved
+
+    // 16B inline transitions: K=2
+    static constexpr int K = 2;
+    uint32_t in_key[K];
+    uint32_t in_to[K];
+
+    // 32B local open-addressing hash: H=4
+    // keys & values are stored directly in-node
+    static constexpr int H = 4;
+    uint32_t h_key[H];
+    uint32_t h_to[H];
+    // total = 16 + 16 + 32 = 64
+
+    SamNode64() {
+        len = 0; link = NIL; occ = 0; _pad0 = 0;
+        for (int i=0;i<K;i++) { in_key[i] = EMPTY_KEY; in_to[i] = NIL; }
+        for (int i=0;i<H;i++) { h_key[i] = EMPTY_KEY; h_to[i] = NIL; }
+    }
+};
+
+// ------------------------------
+// Small hash for 4-slot probing
+// ------------------------------
+static inline uint32_t fast_hash32(uint32_t x) {
+    // cheap mix (not cryptographic)
+    x ^= x >> 16;
+    x *= 0x7feb352d;
+    x ^= x >> 15;
+    x *= 0x846ca68b;
+    x ^= x >> 16;
+    return x;
+}
+
+// ------------------------------------
+// Core SAM with in-node transitions only
+// ------------------------------------
+class SamL3Core {
+public:
+    explicit SamL3Core(size_t max_states_hint) {
+        st.reserve(max_states_hint);
+        st.push_back(SamNode64()); // root
+        st[0].link = NIL;
+        sz = 1;
+        last = 0;
+
+        // streaming match state
+        m_state = 0;
+        m_len = 0;
+    }
+
+    void clear() {
+        st.clear();
+        st.push_back(SamNode64());
+        in_cnt.resize(st.size() * SamNode64::K, 0);
+        h_cnt.resize(st.size() * SamNode64::H, 0);
+        st[0].link = NIL;
+        in_cnt.assign(SamNode64::K, 0);
+        h_cnt.assign(SamNode64::H, 0);
+        in_cnt.assign(SamNode64::K, 0);
+        h_cnt.assign(SamNode64::H, 0);
+        sz = 1;
+        last = 0;
+        m_state = 0;
+        m_len = 0;
+    }
+
+    // O(1) amortized extend
+    void extend(uint32_t token) {
+        uint32_t cur = new_state();
+        st[cur].len = st[last].len + 1;
+        st[cur].occ = 1;
+
+        uint32_t p = last;
+        while (p != NIL && !has_edge(p, token)) {
+            set_edge(p, token, cur);
+            p = st[p].link;
+        }
+
+        if (p == NIL) {
+            st[cur].link = 0;
+        } else {
+            uint32_t q = get_edge(p, token);
+            if (st[p].len + 1 == st[q].len) {
+                st[cur].link = q;
+            } else {
+                uint32_t clone = new_state(true /*clone*/);
+                st[clone] = st[q];          // copy transitions
+                st[clone].len = st[p].len + 1;
+                st[clone].occ = 0;          // clone does not add direct occurrences
+
+                while (p != NIL && get_edge(p, token) == q) {
+                    set_edge(p, token, clone);
+                    p = st[p].link;
+                }
+
+                st[q].link = st[cur].link = clone;
+            }
+        }
+        last = cur;
+
+        // Update streaming match (useful for Tier-0 propose)
+        feed_match(token);
+
+        // (optional) propagate occurrence upward lazily; for Tier-0 greedy, local occ is enough
+    }
+
+    // Maintain current match state for streaming context
+    void feed_match(uint32_t token) {
+        while (m_state != NIL && !has_edge(m_state, token)) {
+            m_state = st[m_state].link;
+            if (m_state != NIL) m_len = std::min(m_len, st[m_state].len);
+        }
+        if (m_state == NIL) {
+            m_state = 0;
+            m_len = 0;
+            return;
+        }
+        m_state = get_edge(m_state, token);
+        m_len += 1;
+        st[m_state].occ += 1; // session-style reinforcement
+    }
+
+    // Cold start: rebuild match from a context stream
+    void reset_match(const std::vector<uint32_t>& ctx) {
+        m_state = 0; m_len = 0;
+        for (uint32_t t : ctx) feed_match(t);
+    }
+
+    // Tier-0 propose:
+    // - max_deg=1 => deterministic-only continuation (Boilerplate Laser)
+    // - min_occ=2 => must have occurred at least twice
+    std::vector<uint32_t> propose(uint32_t k_max,
+                                  uint32_t min_occ = 2,
+                                  uint32_t max_deg = 1) const {
+        std::vector<uint32_t> out;
+        out.reserve(k_max);
+
+        uint32_t s = m_state;
+        if (s == NIL) return out;
+
+        for (uint32_t i=0; i<k_max; i++) {
+            uint32_t deg = out_degree(s);
+            if (deg == 0) break;
+            if (deg > max_deg) break; // structural entropy cutoff
+
+            // pick single outgoing edge if deg==1
+            uint32_t best_tok = 0;
+            uint32_t best_to  = NIL;
+            uint32_t best_occ = 0;
+
+            // inline scan
+            for (int j=0;j<SamNode64::K;j++) {
+                uint32_t k = st[s].in_key[j];
+                if (k == EMPTY_KEY) continue;
+                uint32_t to = st[s].in_to[j];
+                if (to == NIL) continue;
+                uint32_t occ = st[to].occ;
+                if (occ > best_occ) { best_occ = occ; best_tok = k; best_to = to; }
+            }
+
+            // hash scan (only 4 slots)
+            for (int j=0;j<SamNode64::H;j++) {
+                uint32_t k = st[s].h_key[j];
+                if (k == EMPTY_KEY) continue;
+                uint32_t to = st[s].h_to[j];
+                if (to == NIL) continue;
+                uint32_t occ = st[to].occ;
+                if (occ > best_occ) { best_occ = occ; best_tok = k; best_to = to; }
+            }
+
+            if (best_to == NIL) break;
+            if (best_occ < min_occ) break;
+
+            out.push_back(best_tok);
+            s = best_to;
+        }
+        return out;
+    }
+
+    // prefetch the suffix-link chain (keeps hot path in L1/L2)
+    void prefetch_hot_suffix_chain(uint32_t steps = 10) const {
+        uint32_t s = m_state;
+        for (uint32_t i=0;i<steps && s!=NIL;i++) {
+            __builtin_prefetch(&st[s], 0, 3);
+            s = st[s].link;
+        }
+    }
+
+    uint32_t dbg_match_state() const { return m_state; }
+    uint32_t dbg_match_len() const { return m_len; }
+    bool dbg_match_has(uint32_t token) const {
+        if (m_state == NIL) return false;
+        return has_edge(m_state, token);
+    }
+
+    void finalize_occ() {
+        uint32_t maxlen = 0;
+        for (const auto &n : st) {
+            if (n.len > maxlen) maxlen = n.len;
+        }
+        std::vector<uint32_t> cnt(maxlen + 1, 0);
+        for (const auto &n : st) {
+            cnt[n.len] += 1;
+        }
+        for (uint32_t i = 1; i <= maxlen; i++) {
+            cnt[i] += cnt[i - 1];
+        }
+        std::vector<uint32_t> order(st.size());
+        for (uint32_t i = 0; i < (uint32_t)st.size(); i++) {
+            uint32_t l = st[i].len;
+            order[--cnt[l]] = i;
+        }
+        for (int i = (int)order.size() - 1; i > 0; i--) {
+            uint32_t v = order[i];
+            uint32_t p = st[v].link;
+            if (p != NIL) {
+                st[p].occ += st[v].occ;
+            }
+        }
+    }
+
+    struct OutEdge {
+        uint32_t token;
+        uint32_t to_state;
+        uint32_t weight;
+    };
+
+    void match_out_edges(std::vector<OutEdge>& out, uint32_t max_edges = 16) const {
+        out.clear();
+        if (m_state == NIL) return;
+        uint32_t s = m_state;
+
+        for (int j = 0; j < SamNode64::K; j++) {
+            uint32_t k = st[s].in_key[j];
+            if (k == EMPTY_KEY) continue;
+            uint32_t to = st[s].in_to[j];
+            if (to == NIL) continue;
+            OutEdge e{ k, to, (uint32_t)in_cnt[s * SamNode64::K + (uint32_t)j] };
+            out.push_back(e);
+            if (out.size() >= max_edges) return;
+        }
+
+        for (int j = 0; j < SamNode64::H; j++) {
+            uint32_t k = st[s].h_key[j];
+            if (k == EMPTY_KEY) continue;
+            uint32_t to = st[s].h_to[j];
+            if (to == NIL) continue;
+            OutEdge e{ k, to, (uint32_t)in_cnt[s * SamNode64::K + (uint32_t)j] };
+            out.push_back(e);
+            if (out.size() >= max_edges) return;
+        }
+    }
+
+    void finalize_edge_counts() {
+        if (st.empty()) return;
+        in_cnt.resize(st.size() * SamNode64::K, 0);
+        h_cnt.resize(st.size() * SamNode64::H, 0);
+        for (uint32_t s = 0; s < (uint32_t)st.size(); s++) {
+            for (int j = 0; j < SamNode64::K; j++) {
+                uint32_t k = st[s].in_key[j];
+                uint32_t to = st[s].in_to[j];
+                if (k == EMPTY_KEY || to == NIL || to >= (uint32_t)st.size()) {
+                    in_cnt[s * SamNode64::K + (uint32_t)j] = 0;
+                    continue;
+                }
+                uint32_t w = (uint32_t)in_cnt[s * SamNode64::K + (uint32_t)j];
+                if (w > 65535u) w = 65535u;
+                in_cnt[s * SamNode64::K + (uint32_t)j] = (uint16_t)w;
+            }
+            for (int j = 0; j < SamNode64::H; j++) {
+                uint32_t k = st[s].h_key[j];
+                uint32_t to = st[s].h_to[j];
+                if (k == EMPTY_KEY || to == NIL || to >= (uint32_t)st.size()) {
+                    h_cnt[s * SamNode64::H + (uint32_t)j] = 0;
+                    continue;
+                }
+                uint32_t w = (uint32_t)h_cnt[s * SamNode64::H + (uint32_t)j];
+                if (w > 65535u) w = 65535u;
+                h_cnt[s * SamNode64::H + (uint32_t)j] = (uint16_t)w;
+            }
+        }
+    }
+
+    size_t states() const { return st.size(); }
+
+private:
+    std::vector<SamNode64> st;
+    std::vector<uint16_t> in_cnt;
+    std::vector<uint16_t> h_cnt;
+    uint32_t sz = 0;
+    uint32_t last = 0;
+
+    // streaming match state
+    uint32_t m_state = 0;
+    uint32_t m_len = 0;
+
+    uint32_t new_state(bool /*clone*/=false) {
+        uint32_t id = sz++;
+        st.push_back(SamNode64());
+        return id;
+    }
+
+    // -------------------------------
+    // Transition ops: inline + hash(4)
+    // -------------------------------
+    bool has_edge(uint32_t s, uint32_t key) const {
+        // inline (2)
+        for (int i=0;i<SamNode64::K;i++) {
+            if (st[s].in_key[i] == key) return true;
+        }
+        // hash (4)
+        uint32_t h = fast_hash32(key);
+        for (int t=0;t<SamNode64::H;t++) {
+            uint32_t idx = (h + (uint32_t)t) & (SamNode64::H - 1); // H=4 power of two
+            uint32_t k = st[s].h_key[idx];
+            if (k == EMPTY_KEY) return false; // empty => not present
+            if (k == key) return true;
+        }
+        return false;
+    }
+
+    uint32_t get_edge(uint32_t s, uint32_t key) const {
+        // inline
+        for (int i=0;i<SamNode64::K;i++) {
+            if (st[s].in_key[i] == key) return st[s].in_to[i];
+        }
+        // hash
+        uint32_t h = fast_hash32(key);
+        for (int t=0;t<SamNode64::H;t++) {
+            uint32_t idx = (h + (uint32_t)t) & (SamNode64::H - 1);
+            uint32_t k = st[s].h_key[idx];
+            if (k == EMPTY_KEY) return NIL;
+            if (k == key) return st[s].h_to[idx];
+        }
+        return NIL;
+    }
+
+    void set_edge(uint32_t s, uint32_t key, uint32_t to) {
+        // update inline if exists
+        for (int i=0;i<SamNode64::K;i++) {
+            if (st[s].in_key[i] == key) { st[s].in_to[i] = to; return; }
+        }
+        // update hash if exists
+        uint32_t h = fast_hash32(key);
+        for (int t=0;t<SamNode64::H;t++) {
+            uint32_t idx = (h + (uint32_t)t) & (SamNode64::H - 1);
+            uint32_t k = st[s].h_key[idx];
+            if (k == key) { st[s].h_to[idx] = to; return; }
+            if (k == EMPTY_KEY) break;
+        }
+        // insert inline if free slot
+        for (int i=0;i<SamNode64::K;i++) {
+            if (st[s].in_key[i] == EMPTY_KEY) {
+                st[s].in_key[i] = key;
+                st[s].in_to[i] = to;
+                return;
+            }
+        }
+        // insert into hash (4-slot linear probe)
+        for (int t=0;t<SamNode64::H;t++) {
+            uint32_t idx = (h + (uint32_t)t) & (SamNode64::H - 1);
+            if (st[s].h_key[idx] == EMPTY_KEY) {
+                st[s].h_key[idx] = key;
+                st[s].h_to[idx]  = to;
+                return;
+            }
+        }
+        // If we overflow 2+4=6 transitions, we drop insertion.
+        // In Boilerplate Laser mode (max_deg=1), this does not matter.
+    }
+
+    uint32_t out_degree(uint32_t s) const {
+        uint32_t deg = 0;
+        for (int i=0;i<SamNode64::K;i++) if (st[s].in_key[i] != EMPTY_KEY) deg++;
+        for (int i=0;i<SamNode64::H;i++) if (st[s].h_key[i] != EMPTY_KEY) deg++;
+        return deg;
+    }
+};
+
+// ----------------------------------------------------
+// Bounded-memory SAM wrapper: 128k token sliding window
+// ----------------------------------------------------
+class SamL3Bounded128k {
+public:
+    SamL3Bounded128k(uint32_t window_tokens = 128000,
+                     uint32_t l3_budget_mb = 16)
+        : W(window_tokens),
+          ring(window_tokens, 0),
+          core(max_states_from_budget(l3_budget_mb)) {
+        ring_len = 0;
+        ring_pos = 0;
+        total_seen = 0;
+    }
+
+    // call only on VERIFIED tokens (Tier-2 accepted output)
+    void extend_verified(uint32_t token) {
+        // write into ring
+        ring[ring_pos] = token;
+        ring_pos = (ring_pos + 1) % W;
+        if (ring_len < W) ring_len++;
+        total_seen++;
+
+        // If not full window yet, extend normally
+        if (ring_len < W) {
+            core.extend(token);
+            return;
+        }
+
+        // Sliding-window policy:
+        // once we have a full ring, rebuild at a cadence to avoid drift.
+        // deterministic cadence: rebuild every R tokens.
+        if ((total_seen % rebuild_stride()) == 0) {
+            rebuild_from_ring();
+        } else {
+            // extend between rebuilds to keep match state hot
+            core.extend(token);
+        }
+    }
+
+    // Tier-0 propose from current streaming match state
+    std::vector<uint32_t> propose(uint32_t k_max,
+                                  uint32_t min_occ = 2,
+                                  uint32_t max_deg = 1) const {
+        return core.propose(k_max, min_occ, max_deg);
+    }
+
+    void prefetch_hot() const {
+        core.prefetch_hot_suffix_chain(10);
+    }
+
+    size_t states() const { return core.states(); }
+
+private:
+    uint32_t W;
+    std::vector<uint32_t> ring;
+    uint32_t ring_len;
+    uint32_t ring_pos;
+    uint64_t total_seen;
+
+    SamL3Core core;
+
+    // L3 sizing: 64B/state, approx states <= (budget_bytes / 64)
+    static size_t max_states_from_budget(uint32_t l3_budget_mb) {
+        size_t bytes = (size_t)l3_budget_mb * 1024u * 1024u;
+        return std::max<size_t>(4096, bytes / 64);
+    }
+
+    // rebuild cadence:
+    // rebuild every ~W/8 tokens => bounded overhead, stable structure
+    uint64_t rebuild_stride() const {
+        return std::max<uint64_t>(2048, (uint64_t)W / 8);
+    }
+
+    void rebuild_from_ring() {
+        // deterministic O(W) rebuild from latest ring_len tokens
+        std::vector<uint32_t> ctx;
+        ctx.reserve(ring_len);
+
+        // reconstruct chronological order: oldest -> newest
+        uint32_t start = (ring_pos + (W - ring_len)) % W;
+        for (uint32_t i=0;i<ring_len;i++) {
+            ctx.push_back(ring[(start + i) % W]);
+        }
+
+        core.clear();
+        for (uint32_t t : ctx) core.extend(t);
+    }
+};

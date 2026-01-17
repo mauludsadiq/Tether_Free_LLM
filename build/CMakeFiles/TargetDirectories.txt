@@ -1,0 +1,6 @@
+/Users/g.bogans/Downloads/Tether_Free_LLM/build/CMakeFiles/tether_demo.dir
+/Users/g.bogans/Downloads/Tether_Free_LLM/build/CMakeFiles/test_smoke.dir
+/Users/g.bogans/Downloads/Tether_Free_LLM/build/CMakeFiles/tether_dispatch_demo.dir
+/Users/g.bogans/Downloads/Tether_Free_LLM/build/CMakeFiles/test.dir
+/Users/g.bogans/Downloads/Tether_Free_LLM/build/CMakeFiles/edit_cache.dir
+/Users/g.bogans/Downloads/Tether_Free_LLM/build/CMakeFiles/rebuild_cache.dir

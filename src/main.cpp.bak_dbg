@@ -1,0 +1,48 @@
+#include <iostream>
+#include <vector>
+#include <cstdint>
+
+#include "sam_l3_bounded.hpp"
+
+static void print_vec(const std::vector<uint32_t>& v) {
+    for (auto x : v) std::cout << x << " ";
+}
+
+int main() {
+    // Build SAM from a stream that contains a strongly repeated deterministic run:
+    // (10 11 12 13 14 15) repeated 3 times.
+    std::vector<uint32_t> stream = {
+        100, 200, 300, 400, 500, 600,
+        10, 11, 12, 13, 14, 15,
+        10, 11, 12, 13, 14, 15,
+        10, 11, 12, 13, 14, 15
+    };
+
+    // Use the core SAM so we can reset_match() for a clean Tier-0 query point.
+    // Budget hint: 1k states is enough for this demo.
+    SamL3Core sam(/*max_states_hint=*/1024);
+
+    for (auto t : stream) {
+        sam.extend(t);
+    }
+
+    sam.finalize_occ();
+
+    // Now query from a suffix that should have a deterministic continuation:
+    // Context ends with: 10 11 12 13 14  -> should propose: 15 ...
+    std::vector<uint32_t> query_ctx = {10, 11, 12, 13, 14};
+    sam.reset_match(query_ctx);
+
+    auto proposed = sam.propose(/*k_max=*/6, /*min_occ=*/2, /*max_deg=*/1);
+
+    std::cout << "Query ctx: ";
+    print_vec(query_ctx);
+    std::cout << "\n";
+
+    std::cout << "SAM proposed " << proposed.size() << " tokens: ";
+    print_vec(proposed);
+    std::cout << "\n";
+
+    std::cout << "SAM states: " << sam.states() << "\n";
+    return 0;
+}

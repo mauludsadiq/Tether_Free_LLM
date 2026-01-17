@@ -1,0 +1,26 @@
+cmake_minimum_required(VERSION 3.16)
+project(Tether_Free_LLM LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+add_library(tether_sam INTERFACE)
+target_include_directories(tether_sam INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+add_executable(tether_demo src/main.cpp)
+target_link_libraries(tether_demo PRIVATE tether_sam)
+
+add_executable(test_smoke tests/test_smoke.cpp)
+target_link_libraries(test_smoke PRIVATE tether_sam)
+
+enable_testing()
+add_test(NAME smoke COMMAND test_smoke)
+
+add_executable(tether_dispatch_demo
+    src/demo_dispatcher.cpp
+    src/dispatcher.cpp
+)
+
+target_include_directories(tether_dispatch_demo PRIVATE include src)
+set_target_properties(tether_dispatch_demo PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)

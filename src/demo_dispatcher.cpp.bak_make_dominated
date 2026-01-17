@@ -1,0 +1,97 @@
+#include <iostream>
+#include <vector>
+#include <cstdint>
+
+#include "sam_l3_bounded.hpp"
+#include "dispatcher.hpp"
+
+static void print_vec(const std::vector<uint32_t>& v) {
+    for (auto x : v) std::cout << x << " ";
+}
+
+struct MockDraft : DraftModel {
+    uint32_t choose_next(const std::vector<uint32_t>&,
+                         const std::vector<uint32_t>& candidates) override {
+        uint32_t best = candidates[0];
+        for (auto t : candidates) best = std::min(best, t);
+        return best;
+    }
+};
+
+static void run_case(const char* title,
+                     const std::vector<uint32_t>& stream,
+                     const std::vector<uint32_t>& query_ctx,
+                     const DispatchCfg& cfg) {
+    std::cout << "\n=== " << title << " ===\n";
+
+    SamL3Core sam(4096);
+    for (auto t : stream) sam.extend(t);
+    sam.finalize_occ();
+    sam.reset_match(query_ctx);
+
+    std::cout << "Query ctx: ";
+    print_vec(query_ctx);
+    std::cout << "\n";
+
+    auto d = sam_branch_decision(sam, cfg.max_branch_options);
+    std::cout << "deg=" << d.degree << " best_prob=" << d.best_prob << " H_norm=" << d.H_norm << "\n";
+
+    if (!d.options.empty()) {
+        std::cout << "options: ";
+        for (auto &o : d.options) {
+            std::cout << "(" << o.token << ",w=" << o.weight << ",p=" << o.prob << ") ";
+        }
+        std::cout << "\n";
+    }
+
+    Proposal prop = dispatch_propose(sam, cfg);
+
+    std::cout << "dispatch=";
+    if (prop.mode == TierMode::SAM_DETERMINISTIC) std::cout << "SAM_DETERMINISTIC";
+    else if (prop.mode == TierMode::SAM_DOMINATED) std::cout << "SAM_DOMINATED";
+    else if (prop.mode == TierMode::DRAFT_ARBITRATE) std::cout << "DRAFT_ARBITRATE";
+    else std::cout << "TARGET_ONLY";
+    std::cout << " confidence=" << prop.confidence << "\n";
+
+    if (!prop.tokens.empty()) {
+        std::cout << "proposed: ";
+        print_vec(prop.tokens);
+        std::cout << "\n";
+    } else if (prop.mode == TierMode::DRAFT_ARBITRATE) {
+        MockDraft draft;
+        Proposal pick = draft_arbitrate_next(sam, cfg, draft, query_ctx);
+        std::cout << "draft chose: ";
+        print_vec(pick.tokens);
+        std::cout << "\n";
+    } else {
+        std::cout << "no proposal\n";
+    }
+
+    std::cout << "SAM states: " << sam.states() << "\n";
+}
+
+int main() {
+    DispatchCfg cfg;
+    cfg.k_max = 6;
+    cfg.min_occ = 2;
+    cfg.p_dom = 0.95f;
+    cfg.H_max = 0.20f;
+    cfg.max_branch_options = 6;
+
+    std::vector<uint32_t> query = {10,11,12,13,14};
+
+    std::vector<uint32_t> stream_det = {
+        10,11,12,13,14,15,
+        10,11,12,13,14,15,
+        10,11,12,13,14,15
+    };
+    run_case("DETERMINISTIC (Tier-0A)", stream_det, query, cfg);
+
+    std::vector<uint32_t> stream_branch = {
+        10,11,12,13,14,15,
+        10,11,12,13,14,99,
+        10,11,12,13,14,15,
+        10,11,12,13,14,99
+    };
+    run_case("BRANCHING (Tier-1 arbitration)", stream_branch, query, cfg);
+
