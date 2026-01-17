@@ -77,7 +77,7 @@ Proposal dispatch_propose(const SamL3Core& sam, const DispatchCfg& cfg) {
         return p;
     }
 
-    if (d.degree > 1 && d.best_prob >= cfg.p_dom && d.H_norm <= cfg.H_max) {
+    if (d.degree > 1 && d.best_prob >= cfg.p_dom) {
         p.mode = TierMode::SAM_DOMINATED;
         p.confidence = d.best_prob;
         p.tokens = sam.propose(cfg.k_max, cfg.min_occ, 2);

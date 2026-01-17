@@ -30,6 +30,8 @@ struct DispatchCfg {
     uint32_t k_max = 6;
     uint32_t min_occ = 2;
     float p_dom = 0.95f;
+    float dom_margin = 0.20f;
+    uint32_t min_best_w = 8;
     float H_max = 0.20f;
     uint32_t max_branch_options = 6;
 };

@@ -75,7 +75,9 @@ int main() {
     cfg.k_max = 6;
     cfg.min_occ = 2;
     cfg.p_dom = 0.95f;
-    cfg.H_max = 0.30f;
+    cfg.dom_margin = 0.20f;
+    cfg.min_best_w = 8;
+    cfg.H_max = 0.20f;
     cfg.max_branch_options = 6;
 
     std::vector<uint32_t> query = {10,11,12,13,14};
