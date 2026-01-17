@@ -1,0 +1,5 @@
+build/
+*.o
+*.bak
+*.bak_*
+.DS_Store
